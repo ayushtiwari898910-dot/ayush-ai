@@ -1,7 +1,7 @@
 {
-  "name": "ayush-ai-whatsapp-bot",
-  "version": "1.0.0",
-  "description": "Personal AI WhatsApp Bot with GF Boyfriend Mode",
+  "name": "ayush-ai-whatsapp-boyfriend-bot",
+  "version": "2.5.0",
+  "description": "Enterprise Grade Personal AI WhatsApp Bot with Boyfriend Mode",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
