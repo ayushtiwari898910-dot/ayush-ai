@@ -1,3 +1,10 @@
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
 const makeWASocket = require('@whiskeysockets/baileys').default;
 const {
   useMultiFileAuthState,
@@ -19,8 +26,9 @@ let isPaired = false;
 let currentPhone = null;
 let isConnecting = false;
 let lastError = null;
+let pairingRequested = false;
 
-// ===== AI AUTO-REPLY STATE (API Key & GF Feature Enabled by Default) =====
+// ===== AI AUTO-REPLY & GF MODE STATE =====
 const aiAutoReplyState = {
   enabled: true,
   apiKey: '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',
@@ -37,10 +45,6 @@ function pushLog(type, msg) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-function isSocketReady() {
-  return !!(sock && isPaired);
 }
 
 // ===== OPENROUTER AI INTEGRATION =====
@@ -79,11 +83,10 @@ async function getAIResponse(userMessage, isGf = false) {
   }
 }
 
-// ===== WhatsApp connection with Fixed Pairing Logic =====
+// ===== WhatsApp Connection with 100% Stable Pairing Logic =====
 async function connectToWhatsApp(phone) {
   if (!phone) throw new Error('Phone number required');
-  if (isConnecting) throw new Error('Connection already in progress');
-  if (isPaired) throw new Error('Already paired');
+  if (isConnecting && !pairingRequested) throw new Error('Connection already in progress');
 
   isConnecting = true;
   currentPhone = phone;
@@ -99,30 +102,14 @@ async function connectToWhatsApp(phone) {
       auth: state,
       printQRInTerminal: false,
       logger: pino({ level: 'silent' }),
-      browser: ['Chrome (Mac OS)', 'Chrome', '120.0.6099.199'], // Standard browser tuple to prevent pairing rejection
+      browser: ['Chrome (Linux)', 'Chrome', '122.0.0.0'],
       mobile: false,
       syncFullHistory: false,
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // FIXED: Proper delay to ensure socket/WebSocket is fully open before requesting pairing code
-    setTimeout(async () => {
-      if (!sock.authState.creds.registered && !isPaired) {
-        try {
-          const cleanPhone = phone.replace(/[^\d]/g, '');
-          const code = await sock.requestPairingCode(cleanPhone);
-          pairingCode = code;
-          pushLog('ok', `Pairing Code Generated Successfully: ${code}`);
-        } catch (err) {
-          lastError = err.message;
-          pushLog('err', `Pairing Code Error: ${err.message}`);
-          isConnecting = false;
-        }
-      }
-    }, 4000);
-
-    // ===== AI AUTO-REPLY INCOMING MESSAGE LISTENER & GF DETECTOR =====
+    // AI Auto-Reply & GF Message Listener
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
       if (!aiAutoReplyState.enabled) return;
@@ -132,7 +119,7 @@ async function connectToWhatsApp(phone) {
         if (!msg.message) continue;
 
         const remoteJid = msg.key.remoteJid;
-        if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@g.us')) continue; // Private chats only
+        if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@g.us')) continue;
 
         const senderPhone = remoteJid.replace('@s.whatsapp.net', '');
         const cleanGfNumber = aiAutoReplyState.gfNumber.replace(/[^\d]/g, '');
@@ -149,7 +136,7 @@ async function connectToWhatsApp(phone) {
           const aiReply = await getAIResponse(text, isGf);
           await sock.sendMessage(remoteJid, { text: aiReply }, { quoted: msg });
           aiAutoReplyState.stats.handled++;
-          pushLog('ok', `[AI Auto-reply] Sent to ${senderPhone} ${isGf ? '(GF Boyfriend Mode ❤️)' : ''}`);
+          pushLog('ok', `[AI Reply] Sent to ${senderPhone} ${isGf ? '(GF Boyfriend Mode ❤️)' : ''}`);
         } catch (e) {
           aiAutoReplyState.stats.failed++;
           pushLog('err', `[AI Error] ${e.message}`);
@@ -160,12 +147,32 @@ async function connectToWhatsApp(phone) {
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect } = update;
 
+      if (connection === 'connecting') {
+        if (!sock.authState.creds.registered && !pairingRequested && !pairingCode) {
+          pairingRequested = true;
+          try {
+            await sleep(4000); // 4 seconds delay to ensure WebSocket is fully stable
+            const cleanPhone = phone.replace(/[^\d]/g, '');
+            const code = await sock.requestPairingCode(cleanPhone);
+            pairingCode = code;
+            pairingRequested = false;
+            pushLog('ok', `Pairing Code Generated Successfully: ${code}`);
+          } catch (err) {
+            lastError = err.message;
+            pairingRequested = false;
+            isConnecting = false;
+            pushLog('err', `Pairing Code Error: ${err.message}`);
+          }
+        }
+      }
+
       if (connection === 'open') {
         isPaired = true;
         pairingCode = null;
         isConnecting = false;
+        pairingRequested = false;
         lastError = null;
-        pushLog('ok', `WhatsApp Connected Successfully (${phone}) | AI Auto-Reply Active!`);
+        pushLog('ok', `WhatsApp Connected Successfully (${phone}) | AI & GF Mode Active!`);
       }
 
       if (connection === 'close') {
@@ -173,72 +180,52 @@ async function connectToWhatsApp(phone) {
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         isPaired = false;
         isConnecting = false;
+        pairingRequested = false;
 
         if (shouldReconnect && currentPhone) {
-          setTimeout(() => connectToWhatsApp(currentPhone).catch(console.error), 3000);
+          setTimeout(() => connectToWhatsApp(currentPhone).catch(console.error), 5000);
         } else if (statusCode === DisconnectReason.loggedOut) {
           pairingCode = null;
           currentPhone = null;
+          if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         }
       }
     });
   } catch (err) {
     isConnecting = false;
+    pairingRequested = false;
     lastError = err.message;
-    throw err;
+    pushLog('err', `Connection Error: ${err.message}`);
   }
 }
 
 // ============================================================
-// EMBEDDED DASHBOARD HTML
+// DASHBOARD HTML
 // ============================================================
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>44YUSH — AI Boyfriend Bot Control Center</title>
+<title>44YUSH — AI Boyfriend Bot</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
-  body{
-    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-    background:#050507;color:#e2e8f0;min-height:100vh;overflow-x:hidden;
-  }
-  body::before{
-    content:"";position:fixed;inset:0;z-index:-2;
-    background:
-      radial-gradient(1200px 800px at 15% 10%, rgba(255,0,60,.18), transparent 60%),
-      linear-gradient(135deg,#050507 0%,#0b0b12 55%,#050507 100%);
-  }
-  .container{max-width:1000px;margin:0 auto;padding:28px 18px 60px;position:relative;z-index:1}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#050507;color:#e2e8f0;min-height:100vh}
+  body::before{content:"";position:fixed;inset:0;z-index:-2;background:radial-gradient(1200px 800px at 15% 10%, rgba(255,0,60,.18), transparent 60%),linear-gradient(135deg,#050507 0%,#0b0b12 55%,#050507 100%)}
+  .container{max-width:1000px;margin:0 auto;padding:28px 18px 60px}
   .brand{text-align:center;margin-bottom:26px}
-  .brand h1{
-    font-size:clamp(22px,4vw,38px);font-weight:900;letter-spacing:3px;
-    background:linear-gradient(180deg,#ffffff 0%,#c9c9d6 45%,#ff003c 130%);
-    -webkit-background-clip:text;background-clip:text;color:transparent;
-  }
+  .brand h1{font-size:clamp(22px,4vw,38px);font-weight:900;letter-spacing:3px;background:linear-gradient(180deg,#ffffff 0%,#c9c9d6 45%,#ff003c 130%);-webkit-background-clip:text;background-clip:text;color:transparent}
   .brand h1 .x{color:#ff003c;-webkit-text-fill-color:#ff003c}
   .brand p{color:#8b8b9c;font-size:11px;letter-spacing:3px;margin-top:6px;text-transform:uppercase}
-  .card{
-    background:linear-gradient(155deg, rgba(20,20,28,.72), rgba(10,10,15,.55));
-    border:1px solid rgba(255,0,60,.28);
-    border-radius:18px;padding:24px;margin-bottom:20px;
-  }
+  .card{background:linear-gradient(155deg, rgba(20,20,28,.72), rgba(10,10,15,.55));border:1px solid rgba(255,0,60,.28);border-radius:18px;padding:24px;margin-bottom:20px}
   .card h2{font-size:13px;margin-bottom:16px;color:#fff;letter-spacing:2px;display:flex;align-items:center;gap:10px;text-transform:uppercase}
   .card h2 .dot{width:8px;height:8px;border-radius:50%;background:#ff003c;box-shadow:0 0 12px #ff003c}
   label{display:block;font-size:11px;color:#9a9aab;margin-bottom:7px;letter-spacing:1.5px;text-transform:uppercase}
-  input,textarea{
-    width:100%;background:rgba(5,5,10,.75);border:1px solid rgba(255,0,60,.25);
-    border-radius:12px;padding:12px 14px;color:#f1f1f6;font-size:14px;outline:none;
-  }
+  input,textarea{width:100%;background:rgba(5,5,10,.75);border:1px solid rgba(255,0,60,.25);border-radius:12px;padding:12px 14px;color:#f1f1f6;font-size:14px;outline:none}
   input:focus,textarea:focus{border-color:#ff003c;box-shadow:0 0 0 3px rgba(255,0,60,.14)}
   textarea{resize:vertical;min-height:80px}
   .field{margin-bottom:14px}
-  button{
-    background:linear-gradient(180deg,#ff0a45,#c40030);color:#fff;border:none;
-    border-radius:12px;padding:13px 24px;font-size:12px;font-weight:700;
-    letter-spacing:2px;text-transform:uppercase;cursor:pointer;width:100%;margin-top:6px;
-  }
+  button{background:linear-gradient(180deg,#ff0a45,#c40030);color:#fff;border:none;border-radius:12px;padding:13px 24px;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;cursor:pointer;width:100%;margin-top:6px}
   button:hover:not(:disabled){transform:translateY(-1px)}
   button.ghost{background:transparent;border:1px solid rgba(255,0,60,.5);color:#ff5277}
   .status-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
@@ -317,13 +304,19 @@ async function startPair(){
   const phone=document.getElementById('phoneInput').value.trim();
   const msgEl=document.getElementById('pairMsg');
   if(!phone)return;
+  document.getElementById('pairBtn').disabled = true;
+  document.getElementById('pairBtn').textContent = 'Connecting...';
   try{
     const res=await fetch('/api/pair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});
     const data=await res.json();
     if(!data.success)throw new Error(data.error);
     document.getElementById('codeSection').classList.remove('hidden');
     pollStatus();
-  }catch(e){showMsg(msgEl,'err',e.message);}
+  }catch(e){
+    showMsg(msgEl,'err',e.message);
+    document.getElementById('pairBtn').disabled = false;
+    document.getElementById('pairBtn').textContent = 'Get Pairing Code';
+  }
 }
 
 async function pollStatus(){
@@ -333,6 +326,12 @@ async function pollStatus(){
       const d = await res.json();
       if(d.code){
         document.getElementById('codeValue').textContent = d.code;
+      }
+      if(d.error){
+        showMsg(document.getElementById('pairMsg'),'err', d.error);
+        document.getElementById('pairBtn').disabled = false;
+        document.getElementById('pairBtn').textContent = 'Get Pairing Code';
+        clearInterval(interval);
       }
       if(d.paired){
         document.getElementById('badge').textContent = 'Connected ('+d.phone+')';
