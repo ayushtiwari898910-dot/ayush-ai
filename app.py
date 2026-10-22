@@ -1,3 +1,4 @@
+import os
 import requests
 from flask import Flask, jsonify, render_template_string, request, session
 
@@ -185,7 +186,6 @@ HTML_TEMPLATE = """
 
 @app.route("/")
 def index():
-    # Fresh page load par history initialize hogi
     session['messages'] = [
         {"role": "system", "content": AYUSH_SYSTEM_PROMPT}
     ]
@@ -232,4 +232,5 @@ def chat():
     return jsonify({"reply": ai_reply})
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
